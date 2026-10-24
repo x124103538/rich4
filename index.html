@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+  <title>大富翁4 · 連線入口</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; min-height: 100dvh; display: grid; place-items: center;
+      background: #0b3b40; color: #fff;
+      font-family: "PingFang TC", "Microsoft JhengHei", system-ui, sans-serif;
+      padding: 20px; text-align: center;
+    }
+    .card { width: min(400px, 100%); display: flex; flex-direction: column; gap: 14px; align-items: center; }
+    h1 { font-size: 24px; margin: 0; }
+    p { font-size: 16px; line-height: 1.5; margin: 0; opacity: 0.9; white-space: pre-line; }
+    .err { color: #ffe14a; }
+    button {
+      font: inherit; font-size: 18px; font-weight: 700; padding: 10px 24px;
+      border-radius: 999px; border: 3px solid #fff3b0; background: #26a65b; color: #fff;
+      cursor: pointer;
+    }
+    button[hidden] { display: none; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>大富翁4</h1>
+    <p id="msg">正在連線到遊戲伺服器…</p>
+    <button id="retry" type="button" hidden>重新嘗試</button>
+  </div>
+  <script>
+    const KEY_STORE = 'rich4.entryKey';
+    const NAME_KEY = 'rich4.profile';
+    const TOKEN_KEY = 'rich4.profileToken';
+    const msg = document.getElementById('msg');
+    const retry = document.getElementById('retry');
+
+    const b64ToBytes = s => {
+      const pad = s.replace(/-/g, '+').replace(/_/g, '/');
+      const bin = atob(pad + '==='.slice((pad.length + 3) % 4));
+      return Uint8Array.from(bin, c => c.charCodeAt(0));
+    };
+    const toB64Url = str => btoa(unescape(encodeURIComponent(str))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    const fromB64Url = s => decodeURIComponent(escape(atob(s.replace(/-/g, '+').replace(/_/g, '/'))));
+
+    // 1. 遊戲登入成功後跳回來把 (name, token) 存進固定網域的 localStorage，立刻跳回遊戲
+    const hash = new URLSearchParams(location.hash.slice(1));
+    const saveRaw = hash.get('r4save');
+    if (saveRaw) {
+      try {
+        const { name, token, back } = JSON.parse(fromB64Url(saveRaw));
+        if (name && token) {
+          localStorage.setItem(NAME_KEY, name);
+          localStorage.setItem(TOKEN_KEY, token);
+        }
+        if (back && /^https:\/\/[a-z0-9-]+\.trycloudflare\.com\/?$/i.test(back)) {
+          location.replace(back);
+        }
+      } catch {}
+    }
+
+    // 2. 讀取或保存金鑰（從網址 #k=... 或 ?k=... 讀入後存進 localStorage）
+    const urlParams = new URLSearchParams(location.search);
+    const kParam = hash.get('k') || urlParams.get('k');
+    if (kParam) {
+      try { localStorage.setItem(KEY_STORE, kParam); } catch {}
+    }
+    let keyStr = kParam || '';
+    if (!keyStr) {
+      try { keyStr = localStorage.getItem(KEY_STORE) || ''; } catch {}
+    }
+
+    function detectRepo() {
+      const m = /^([^.]+)\.github\.io$/i.exec(location.hostname);
+      const seg = location.pathname.split('/').filter(Boolean)[0];
+      return m && seg ? `${m[1]}/${seg}` : '';
+    }
+
+    async function loadTunnel() {
+      const repo = detectRepo();
+      const t = Date.now();
+      if (repo) {
+        try {
+          const r = await fetch(`https://api.github.com/repos/${repo}/contents/tunnel.json?t=${t}`, {
+            headers: { Accept: 'application/vnd.github.raw+json' },
+            cache: 'no-store',
+          });
+          if (r.ok) return await r.json();
+        } catch {}
+      }
+      const r = await fetch(`./tunnel.json?t=${t}`, { cache: 'no-store' });
+      if (!r.ok) throw new Error('尚未啟動伺服器');
+      return r.json();
+    }
+
+    async function decryptUrl(info, secret) {
+      const rawKey = b64ToBytes(secret);
+      const cryptoKey = await crypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['decrypt']);
+      const plain = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: b64ToBytes(info.iv) },
+        cryptoKey,
+        b64ToBytes(info.data),
+      );
+      return new TextDecoder().decode(plain);
+    }
+
+    async function go() {
+      retry.hidden = true;
+      msg.className = '';
+      msg.textContent = '正在尋找最新的遊戲通道…';
+      if (!saveRaw) {
+        if (!keyStr) {
+          msg.className = 'err';
+          msg.textContent = '缺少連線金鑰，請使用房主提供的完整書籤網址開啟。';
+          return;
+        }
+        try {
+          const info = await loadTunnel();
+          const url = (await decryptUrl(info, keyStr)).replace(/\/+$/, '');
+          if (!/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/i.test(url)) throw new Error('bad url');
+          msg.textContent = '正在進入遊戲…';
+          let name = '', token = '';
+          try {
+            name = localStorage.getItem(NAME_KEY) || '';
+            token = localStorage.getItem(TOKEN_KEY) || '';
+          } catch {}
+          const entry = location.origin + location.pathname;
+          const payload = toB64Url(JSON.stringify({ name, token, entry }));
+          location.replace(`${url}/#r4=${payload}`);
+        } catch {
+          msg.className = 'err';
+          msg.textContent = '目前連不上遊戲伺服器（可能還沒開機，或金鑰不對）。\n請確認伺服器已啟動後再試一次。';
+          retry.hidden = false;
+        }
+      }
+    }
+
+    retry.onclick = go;
+    if (!saveRaw) go();
+  </script>
+</body>
+</html>
